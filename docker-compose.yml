@@ -1,0 +1,81 @@
+networks:
+  shared_network:        # внешняя сеть, где видит master‑Traefik
+    external: true
+  project_net:           # внутренняя сеть проекта
+    driver: bridge
+
+services:
+  traefik_local:
+    image: traefik:v2.11
+    container_name: portfolio_traefik_local
+    restart: unless-stopped
+    networks:
+      - shared_network
+      - project_net
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      # Локальный Traefik слушает ТОЛЬКО внутри проекта (8080), без TLS и без dashboard
+      - "--entrypoints.web.address=:8080"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--api=false"
+    # Эти labels читает master‑Traefik: он создаёт HTTPS‑роутеры и шлёт трафик на 8080 сюда
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=shared_network"
+
+      # Middleware: HTTP -> HTTPS ТОЛЬКО для этого домена
+      - "traefik.http.middlewares.olh-https-redirect.redirectscheme.scheme=https"
+      - "traefik.http.middlewares.olh-https-redirect.redirectscheme.permanent=true"
+
+      # HTTP (80) редирект на HTTPS
+      - "traefik.http.routers.olh-redirect.rule=Host(`olehholub.duckdns.org`)"
+      - "traefik.http.routers.olh-redirect.entrypoints=web"
+      - "traefik.http.routers.olh-redirect.middlewares=redirect-to-https"
+
+      # HTTPS (443) основной роутер + выпуск сертификата на master
+      - "traefik.http.routers.olh.rule=Host(`olehholub.duckdns.org`)"
+      - "traefik.http.routers.olh.entrypoints=websecure"
+      - "traefik.http.routers.olh.tls.certresolver=myresolver"
+
+      # В какую «службу» слать трафик (сюда же, на 8080 локального Traefik)
+      - "traefik.http.services.portfolio.loadbalancer.server.port=8080"
+
+  
+  # app:
+  #     # Замените на ваш образ/сборку приложения
+  #     # image: your/portfolio-image:latest
+  #     build:
+  #       context: .
+  #       dockerfile: Dockerfile
+  #     container_name: portfolio_app
+  #     restart: unless-stopped
+  #     networks:
+  #       - project_net
+  #     environment:
+  #       - FLASK_ENV=production
+  #     # Ничего наружу не пробрасываем — только локальный Traefik видит сервис
+  #     labels:
+  #       - "traefik.enable=true"
+  #       - "traefik.docker.network=project_net"
+  #       # Локальный Traefik роутит всё на приложение (по умолчанию на /)
+  #       - "traefik.http.routers.app.rule=PathPrefix(`/`)"
+  #       - "traefik.http.routers.app.entrypoints=web"
+  #       - "traefik.http.services.app.loadbalancer.server.port=5000"
+
+
+# volumes:
+#   # netdata_data:
+#   #     driver: local
+#   #     driver_opts:
+#   #       o: bind
+#   #       type: none
+#   #       device: /home/superadmin/traefik_master/netdata
+#   portainer_data:
+#       driver: local
+#       driver_opts:
+#         o: bind
+#         type: none
+#         device: /home/superadmin/traefik_master/portainer
+  
