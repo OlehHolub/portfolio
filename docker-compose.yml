@@ -42,7 +42,25 @@ services:
       # В какую «службу» слать трафик (сюда же, на 8080 локального Traefik)
       - "traefik.http.services.portfolio.loadbalancer.server.port=8080"
 
-  
+  flask_app:
+    build: 
+      context: .
+      dockerfile: app/Dockerfile
+    container_name: portfolio_flask
+    restart: unless-stopped
+    networks:
+      - project_net
+    expose:
+      - "8000"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=project_net"
+
+      - "traefik.http.routers.flask_local.entrypoints=web"
+      - "traefik.http.routers.flask_local.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.flask_local.service=flask_svc"
+
+      - "traefik.http.services.flask_svc.loadbalancer.server.port=8000"
   # app:
   #     # Замените на ваш образ/сборку приложения
   #     # image: your/portfolio-image:latest
