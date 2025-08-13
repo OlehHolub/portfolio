@@ -1,8 +1,11 @@
+
 networks:
-  shared_network:        # внешняя сеть, где видит master‑Traefik
+  shared_network:            # внешний мост, который видит master-Traefik
     external: true
-  project_net:           # внутренняя сеть проекта
+  project_net:               # внутренняя сеть проекта
     driver: bridge
+
+
 
 services:
   traefik_local:
@@ -15,85 +18,174 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
-      # Локальный Traefik слушает ТОЛЬКО внутри проекта (8080), без TLS и без dashboard
-      - "--entrypoints.web.address=:8080"
-      - "--providers.docker=true"
-      - "--providers.docker.exposedbydefault=false"
-      - "--api=false"
-    # Эти labels читает master‑Traefik: он создаёт HTTPS‑роутеры и шлёт трафик на 8080 сюда
+      # Локально слушаем только HTTP (8080). Master за нас делает HTTPS.
+      - --entrypoints.web.address=:8080
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      # ЛОКАЛЬНЫЙ Traefik «видит» только контейнеры с меткой traefik.constraint-label=local
+      - --providers.docker.constraints=Label(`traefik.constraint-label`,`local`)
+      - --api=false
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=shared_network"
+      # Эти метки читает MASTER-Traefik (он в shared_network). Он будет проксировать трафик в traefik_local.
+      - traefik.enable=true
+      - traefik.constraint-label=master
+      - traefik.docker.network=shared_network
 
-      # Middleware: HTTP -> HTTPS ТОЛЬКО для этого домена
-      - "traefik.http.middlewares.olh-https-redirect.redirectscheme.scheme=https"
-      - "traefik.http.middlewares.olh-https-redirect.redirectscheme.permanent=true"
+      # Глобальный редирект 80 -> 443 на master
+      - traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https
+      - traefik.http.middlewares.redirect-to-https.redirectscheme.permanent=true
 
-      # HTTP (80) редирект на HTTPS
-      - "traefik.http.routers.olh-redirect.rule=Host(`olehholub.duckdns.org`)"
-      - "traefik.http.routers.olh-redirect.entrypoints=web"
-      - "traefik.http.routers.olh-redirect.middlewares=redirect-to-https"
+      # :80 → :443
+      - traefik.http.routers.olh-redirect.rule=Host(`olehholub.duckdns.org`)
+      - traefik.http.routers.olh-redirect.entrypoints=web
+      - traefik.http.routers.olh-redirect.middlewares=redirect-to-https
+      - traefik.http.routers.olh-redirect.service=local-traefik
 
-      # HTTPS (443) основной роутер + выпуск сертификата на master
-      - "traefik.http.routers.olh.rule=Host(`olehholub.duckdns.org`)"
-      - "traefik.http.routers.olh.entrypoints=websecure"
-      - "traefik.http.routers.olh.tls.certresolver=myresolver"
+      # :443 → внутрь локального Traefik'а на :8080
+      - traefik.http.routers.olh.rule=Host(`olehholub.duckdns.org`)
+      - traefik.http.routers.olh.entrypoints=websecure
+      - traefik.http.routers.olh.tls.certresolver=myresolver
+      - traefik.http.routers.olh.service=local-traefik
 
-      # В какую «службу» слать трафик (сюда же, на 8080 локального Traefik)
-      - "traefik.http.services.portfolio.loadbalancer.server.port=8080"
+      # Сервис указывает порт traefik_local внутри контейнера
+      - traefik.http.services.local-traefik.loadbalancer.server.port=8080
+
+
+
+  # PostgreSQL
+  postgres:
+    image: postgres:16
+    container_name: portfolio_postgres
+    restart: unless-stopped
+    networks: 
+      - project_net
+    env_file:
+      - .env
+    volumes:
+      - postgres_data:${PGDATA}
+    # Проверяем готовность сокетом, не требуем curl/wget/netcat
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U $${POSTGRES_USER:-postgres} -d postgres || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+
+  # pgAdmin: доступ по https://olehholub.duckdns.org/pgadmin
+  pgadmin:
+    image: dpage/pgadmin4:8
+    container_name: portfolio_pgadmin
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      traefik_local:
+        condition: service_started
+    networks:
+      - project_net              # ! та же сеть, где запущен postgres
+    env_file:
+      - .env          # ! файл лежит рядом с docker-compose.yml
+    labels:
+      # включаем проксирование через локальный Traefik
+      - traefik.enable=true
+      - traefik.constraint-label=local
+      - traefik.docker.network=project_net
+
+      # роутер: всё под /pgadmin уходит в этот сервис
+      - traefik.http.routers.pgadmin.entrypoints=web
+      - traefik.http.routers.pgadmin.rule=PathPrefix(`/pgadmin`)
+      - traefik.http.routers.pgadmin.service=pgadmin-svc
+
+      # middleware, который сообщает приложению "мы под /pgadmin и по HTTPS:443"
+      - traefik.http.routers.pgadmin.middlewares=pgadmin-headers
+      - traefik.http.middlewares.pgadmin-headers.headers.customrequestheaders.X-Script-Name=/pgadmin
+      - traefik.http.middlewares.pgadmin-headers.headers.customrequestheaders.X-Forwarded-Proto=https
+      - traefik.http.middlewares.pgadmin-headers.headers.customrequestheaders.X-Forwarded-Port=443
+
+      # внутренний порт контейнера pgAdmin
+      - traefik.http.services.pgadmin-svc.loadbalancer.server.port=80
+
+
 
   flask_app:
-    build: 
+    build:
       context: .
       dockerfile: app/Dockerfile
     container_name: portfolio_flask
     restart: unless-stopped
+    depends_on:
+      traefik_local:
+        condition: service_started
+      postgres:
+        condition: service_healthy   # если Flask не зависит от БД — можешь убрать
     networks:
-      - project_net
-    expose:
-      - "8000"
+    - project_net                  # ВАЖНО: та же сеть, что и traefik_local
+    # порт наружу не публикуем — Traefik ходит по внутреннему порту
     labels:
-      - "traefik.enable=true"
-      - "traefik.docker.network=project_net"
+      - traefik.enable=true
+      - traefik.constraint-label=local       # локальный Traefik увидит этот сервис
+      - traefik.docker.network=project_net   # он же и подключится к этой сети
 
-      - "traefik.http.routers.flask_local.entrypoints=web"
-      - "traefik.http.routers.flask_local.rule=PathPrefix(`/`)"
-      - "traefik.http.routers.flask_local.service=flask_svc"
+      # Роутер на корень: всё, что не /pgadmin и т.п., отдаёт Flask
+      - traefik.http.routers.flask.entrypoints=web
+      - traefik.http.routers.flask.rule=PathPrefix(`/`)
+      - traefik.http.routers.flask.priority=1  # специфичные пути (типа /pgadmin) выигрывают
+      - traefik.http.routers.flask.service=flask-svc
 
-      - "traefik.http.services.flask_svc.loadbalancer.server.port=8000"
-  # app:
-  #     # Замените на ваш образ/сборку приложения
-  #     # image: your/portfolio-image:latest
-  #     build:
-  #       context: .
-  #       dockerfile: Dockerfile
-  #     container_name: portfolio_app
-  #     restart: unless-stopped
-  #     networks:
-  #       - project_net
-  #     environment:
-  #       - FLASK_ENV=production
-  #     # Ничего наружу не пробрасываем — только локальный Traefik видит сервис
-  #     labels:
-  #       - "traefik.enable=true"
-  #       - "traefik.docker.network=project_net"
-  #       # Локальный Traefik роутит всё на приложение (по умолчанию на /)
-  #       - "traefik.http.routers.app.rule=PathPrefix(`/`)"
-  #       - "traefik.http.routers.app.entrypoints=web"
-  #       - "traefik.http.services.app.loadbalancer.server.port=5000"
+      # Подсказываем приложению, что внешне мы по HTTPS:443 (для правильных ссылок/редиректов)
+      - traefik.http.routers.flask.middlewares=flask-headers
+      - traefik.http.middlewares.flask-headers.headers.customrequestheaders.X-Forwarded-Proto=https
+      - traefik.http.middlewares.flask-headers.headers.customrequestheaders.X-Forwarded-Port=443
+
+      # Внутренний порт приложения в контейнере (должен совпадать с Gunicorn)
+      - traefik.http.services.flask-svc.loadbalancer.server.port=8000
 
 
-# volumes:
-#   # netdata_data:
-#   #     driver: local
-#   #     driver_opts:
-#   #       o: bind
-#   #       type: none
-#   #       device: /home/superadmin/traefik_master/netdata
-#   portainer_data:
-#       driver: local
-#       driver_opts:
-#         o: bind
-#         type: none
-#         device: /home/superadmin/traefik_master/portainer
+
+
+  # Jupyter: доступ по https://<твой_домен>/jupyter
+  jupyter:
+    image: jupyter/base-notebook:python-3.11
+    container_name: portfolio_jupyter
+    restart: unless-stopped
+    depends_on:
+      traefik_local:
+        condition: service_started
+    networks:
+      - project_net                     # ! та же сеть, что и traefik_local
+    env_file:
+      - .env                             # ! файл рядом с docker-compose.yml (см. ниже)
+    volumes:
+      - notebooks_data:/home/jovyan/work  # сохранение тетрадей в volume
+    # Запускаем без «магии», список аргументов (удобно комментировать)
+    command:
+      - start-notebook.py
+      - --IdentityProvider.token=''                 # отключаем токен → будет запрошен пароль
+      - --ServerApp.base_url=/jupyter               # ключ к подпути (НЕ использовать StripPrefix)
+      - --ServerApp.trust_xheaders=True             # доверяем заголовкам прокси (Traefik)
+      - --ServerApp.root_dir=/home/jovyan/work
+    labels:
+      - traefik.enable=true
+      - traefik.constraint-label=local              # локальный Traefik видит такие сервисы
+      - traefik.docker.network=project_net          # явно сеть для Traefik
+
+      # Роутер под подпуть /jupyter
+      - traefik.http.routers.jupyter.entrypoints=web
+      - traefik.http.routers.jupyter.rule=PathPrefix(`/jupyter`)
+      - traefik.http.routers.jupyter.service=jupyter-svc
+
+      # Подсказываем бэкенду, что внешне мы по HTTPS:443 → правильные ссылки/редиректы
+      - traefik.http.routers.jupyter.middlewares=jupyter-headers
+      - traefik.http.middlewares.jupyter-headers.headers.customrequestheaders.X-Forwarded-Proto=https
+      - traefik.http.middlewares.jupyter-headers.headers.customrequestheaders.X-Forwarded-Port=443
+
+      # Внутренний порт контейнера Jupyter
+      - traefik.http.services.jupyter-svc.loadbalancer.server.port=8888
+
+
+volumes:
+  postgres_data:
+  notebooks_data:
   
+
+
