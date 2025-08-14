@@ -145,8 +145,12 @@ services:
 
   # Jupyter: доступ по https://<твой_домен>/jupyter
   jupyter:
-    image: jupyter/base-notebook:python-3.11
+    # image: jupyter/base-notebook:python-3.11
+    build:
+      context: ./jupyter                # тут лежат Dockerfile и requirements.txt
+      dockerfile: Dockerfile
     container_name: portfolio_jupyter
+    user: "1000:1000"
     restart: unless-stopped
     depends_on:
       traefik_local:
@@ -156,7 +160,18 @@ services:
     env_file:
       - .env                             # ! файл рядом с docker-compose.yml (см. ниже)
     volumes:
-      - notebooks_data:/home/jovyan/work  # сохранение тетрадей в volume
+      - type: bind
+        source: /home/superadmin/portfolio/jupyter/notebooks
+        target: /home/jovyan/work
+      - type: bind
+        source: /home/superadmin/.gcp/bq-key.json
+        target: /home/jovyan/.gcp/bq-key.json
+        read_only: true
+      - type: bind
+        source: /home/superadmin/portfolio/jupyter/py_src           # <— твои модули
+        target: /home/jovyan/py_src
+      
+      # - notebooks_data:/home/jovyan/work  # сохранение тетрадей в volume
     # Запускаем без «магии», список аргументов (удобно комментировать)
     command:
       - start-notebook.py
@@ -185,7 +200,12 @@ services:
 
 volumes:
   postgres_data:
-  notebooks_data:
+  # notebooks_data:
+  #   driver: local
+  #   driver_opts:
+  #     type: none
+  #     o: bind
+  #     device: /home/superadmin/portfolio/jupyter_notebooks   # ПУТЬ НА ХОСТЕ
   
 
 
