@@ -9,7 +9,7 @@ QUERY_LIMIT_BYTES = 1 * 1024**4      # 1 TB
 STORAGE_LIMIT_BYTES = 10 * 1024**3   # 10 GB
 
 # Какие multi‑region проверять (если работаешь только в EU — оставь ['region-eu'])
-DEFAULT_REGIONS = ['region-eu', 'region-us']
+DEFAULT_REGIONS = ['region-eu','region-us']
 
 
 def _region_to_location(region: str) -> str:
@@ -30,45 +30,59 @@ def _month_bounds_utc() -> Tuple[datetime, datetime]:
     return start, end
 
 
-def _sum_query_bytes_billed(client: bigquery.Client, regions: Iterable[str]) -> int:
-    """Сумма total_bytes_billed по всем QUERY‑джобам за текущий месяц (по проекту)."""
-    start, end = _month_bounds_utc()
+def _sum_query_bytes_billed(
+    client: bigquery.Client,
+    regions: Iterable[str],
+    project_id: Optional[str] = None,
+) -> int:
+    """
+    Сумма total_bytes_billed за текущий месяц, точь-в-точь как в твоём проверочном примере:
+    берём JOBS_BY_PROJECT → группируем по дням → суммируем billed_bytes в pandas.
+    Фильтр по project_id убран (как в твоём SQL), чтобы исключить влияние прав/особенностей вью.
+    """
     total = 0
     for region in regions:
-        location = _region_to_location(region)
+        location = _region_to_location(region)  # 'region-us' -> 'US'
         sql = f"""
-        SELECT COALESCE(SUM(total_bytes_billed), 0) AS billed
+        SELECT
+          DATE(creation_time) AS day,
+          SUM(total_bytes_billed) AS billed_bytes
         FROM `{region}`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
-        WHERE creation_time >= @start AND creation_time < @end
-          AND job_type = 'QUERY' AND state = 'DONE'
+        WHERE
+          creation_time >= TIMESTAMP_TRUNC(CURRENT_TIMESTAMP(), MONTH)
+          AND job_type = 'QUERY'
+        GROUP BY day
+        ORDER BY day
         """
-        job = client.query(
-            sql,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ScalarQueryParameter("start", "TIMESTAMP", start),
-                    bigquery.ScalarQueryParameter("end", "TIMESTAMP", end),
-                ]
-            ),
-            location=location
-        )
-        total += int(list(job)[0]["billed"])
+        # Важно: укажем location, чтобы не было рассинхрона по региону
+        job = client.query(sql, location=location)
+        df = job.result().to_dataframe()  # тот же приём, что в твоём рабочем коде
+        if not df.empty:
+            total += int(df["billed_bytes"].fillna(0).sum())
+    print(f"[DEBUG] {region}: billed_this_month_GB = { (df['billed_bytes'].sum()/1024**3) if not df.empty else 0 :.2f}")
     return total
 
 
-def _sum_storage_bytes(client: bigquery.Client, regions: Iterable[str], project_id: Optional[str]) -> int:
+
+def _sum_storage_bytes(
+    client: bigquery.Client,
+    regions: Iterable[str],
+    project_id: Optional[str],
+    ) -> int:
     """
     Итог логических байт хранения по проекту (active + long_term).
-    Быстрый путь: TABLE_STORAGE_BY_PROJECT. Фолбэк: суммирование по датасетам.
+    Сначала пытаемся через TABLE_STORAGE_BY_PROJECT (рекомендуется),
+    иначе — суммируем по датасетам в нужной локации.
     """
     if not project_id:
         project_id = client.project
 
     total_bytes = 0
+
     for region in regions:
         location = _region_to_location(region)
 
-        # 1) Попытка через *_BY_PROJECT
+        # 1) Предпочтительный путь: агрегат по проекту
         try:
             sql = f"""
             SELECT COALESCE(SUM(active_logical_bytes + long_term_logical_bytes), 0) AS logical_bytes
@@ -80,14 +94,18 @@ def _sum_storage_bytes(client: bigquery.Client, regions: Iterable[str], project_
                 job_config=bigquery.QueryJobConfig(
                     query_parameters=[bigquery.ScalarQueryParameter("project", "STRING", project_id)]
                 ),
-                location=location
+                location=location,
             )
-            total_bytes += int(list(job)[0]["logical_bytes"])
-            continue
+            res = job.result()
+            row = next(iter(res), None)
+            if row and row["logical_bytes"] is not None:
+                total_bytes += int(row["logical_bytes"])
+                continue  # перешли к следующему региону
         except Exception:
+            # пойдём фолбэком
             pass
 
-        # 2) Фолбэк: по датасетам в нужной локации
+        # 2) Фолбэк: собираем по датасетам нужной локации
         for ds in client.list_datasets(project=project_id):
             try:
                 ds_ref = client.get_dataset(ds.reference)
@@ -98,7 +116,10 @@ def _sum_storage_bytes(client: bigquery.Client, regions: Iterable[str], project_
                 FROM `{project_id}.{ds_ref.dataset_id}.INFORMATION_SCHEMA.TABLE_STORAGE`
                 """
                 job = client.query(sql, location=ds_ref.location)
-                total_bytes += int(list(job)[0]["logical_bytes"])
+                res = job.result()
+                row = next(iter(res), None)
+                if row and row["logical_bytes"] is not None:
+                    total_bytes += int(row["logical_bytes"])
             except Exception:
                 continue
 
@@ -132,7 +153,7 @@ def check_free_tier_allowance(
     if not project_id:
         project_id = client.project
 
-    used_query = _sum_query_bytes_billed(client, regions)
+    used_query = _sum_query_bytes_billed(client, regions, project_id=project_id)
     used_storage = _sum_storage_bytes(client, regions, project_id)
 
     planned = 0
@@ -212,6 +233,8 @@ def safe_query(
 
     # Если не упало — выполняем
     job = client.query(sql, job_config=job_config, location=location)
+    # print("client.project =", client.project)
+    # print("regions =", list(DEFAULT_REGIONS))
 
     if to_dataframe:
         import pandas as pd  # noqa: F401

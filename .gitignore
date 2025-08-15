@@ -21,6 +21,10 @@ dmypy.json
 # Pytest
 .pytest_cache/
 
+# Jupyter
+/jupyter/notebooks/
+/jupyter/notebooks/**/.ipynb_checkpoints/
+
 # Coverage reports
 htmlcov/
 .coverage
